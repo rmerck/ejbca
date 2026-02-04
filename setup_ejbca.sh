@@ -30,6 +30,34 @@ OPT_IMAGE_TAG="latest"
 
 MIN_DISK_SPACE_MB=5000
 
+# =============================================================================
+# FIX #4: Container name constants (MAJOR IMPROVEMENT)
+# Define container names as constants to improve maintainability and reusability.
+# All references throughout the script now use these constants.
+# =============================================================================
+POSTGRES_CONTAINER="ejbca-postgres"
+EJBCA_CONTAINER="ejbca-app"
+NGINX_CONTAINER="ejbca-nginx"
+
+# =============================================================================
+# FIX #7: Docker Compose command detection (OPTIONAL ENHANCEMENT)
+# Check for both 'docker compose' (plugin) and 'docker-compose' (standalone)
+# to support different installation methods.
+# =============================================================================
+COMPOSE_CMD=""
+
+detect_compose_command() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+    return 0
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+    return 0
+  else
+    return 1
+  fi
+}
+
 usage() {
   cat <<EOF
 Usage: sudo $0 [--force] [--yes] [--hostname <fqdn>] [--image-tag <tag>]
@@ -177,6 +205,20 @@ log ">>> [1/12] Installing prerequisites + Docker (official repo)..."
 retry_backoff 3 apt-get update -y || die "apt-get update failed"
 retry_backoff 3 apt-get install -y ca-certificates curl gnupg lsb-release openssl jq dnsutils || die "Failed installing prerequisites"
 
+# =============================================================================
+# FIX #2: Validate jq dependency (CRITICAL FIX)
+# jq is now installed as a prerequisite above, but we also add a runtime check
+# to provide graceful degradation if it somehow becomes unavailable.
+# The JQ_AVAILABLE variable is used later in diagnostic output.
+# =============================================================================
+JQ_AVAILABLE=false
+if command -v jq >/dev/null 2>&1; then
+  JQ_AVAILABLE=true
+  log "jq is available for JSON parsing"
+else
+  log "WARNING: jq not installed, some diagnostics will be limited"
+fi
+
 install -m 0755 -d /etc/apt/keyrings
 if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
   retry_backoff 3 bash -lc 'curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg' \
@@ -200,8 +242,10 @@ systemctl start docker || die "Failed to start docker"
 log "Waiting for Docker daemon to be ready..."
 retry_backoff 10 docker info >/dev/null 2>&1 || die "Docker daemon did not become ready"
 
+# FIX #7: Detect compose command after Docker is installed
+detect_compose_command || die "Neither docker compose plugin nor docker-compose binary found"
 log "Docker: $(docker --version)"
-log "Compose: $(docker compose version)"
+log "Compose: $(${COMPOSE_CMD} version)"
 
 # --------------------------- step 2: firewall detection/configuration ---------------------------
 log ">>> [2/12] Checking firewall configuration..."
@@ -276,36 +320,37 @@ chown root:root "${BASE_DIR}/data" "${BASE_DIR}/data/ejbca"
 # --------------------------- step 5: cleanup for --force ---------------------------
 if "${OPT_FORCE}"; then
   log ">>> [5/12] --force: Stopping containers and backing up volumes..."
-  
+
   cd "${BASE_DIR}" 2>/dev/null || true
   ENV_FILE_TMP="${BASE_DIR}/.env"
   COMPOSE_FILE_TMP="${BASE_DIR}/docker-compose.yml"
-  
+
   if [[ -f "${COMPOSE_FILE_TMP}" ]]; then
     RUN_AS_EJBCA=(sudo -u "${EJBCA_USER}" env HOME="${EJBCA_HOME}" DOCKER_CONFIG="${DOCKER_CONFIG_DIR}")
-    
+
     log "Stopping all containers..."
-    "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE_TMP}" -f "${COMPOSE_FILE_TMP}" down -v 2>/dev/null || true
-    
+    # FIX #7: Use COMPOSE_CMD variable instead of hardcoded 'docker compose'
+    "${RUN_AS_EJBCA[@]}" ${COMPOSE_CMD} --env-file "${ENV_FILE_TMP}" -f "${COMPOSE_FILE_TMP}" down -v 2>/dev/null || true
+
     sleep 3
   fi
-  
+
   for vol in ejbca_pgdata ejbca_data ejbca_logs; do
     if docker volume inspect "${vol}" >/dev/null 2>&1; then
       BACKUP_DIR="${BASE_DIR}/backups/volumes_$(ts_suffix)"
       mkdir -p "${BACKUP_DIR}"
-      
+
       VOL_PATH=$(docker volume inspect "${vol}" --format '{{ .Options.device }}' 2>/dev/null || echo "")
       if [[ -n "${VOL_PATH}" && -d "${VOL_PATH}" ]]; then
         log "Backing up volume ${vol} from ${VOL_PATH}..."
         tar -czf "${BACKUP_DIR}/${vol}.tar.gz" -C "${VOL_PATH}" . 2>/dev/null || log "Warning: Backup of ${vol} failed"
       fi
-      
+
       log "Removing volume ${vol}..."
       docker volume rm -f "${vol}" 2>/dev/null || true
     fi
   done
-  
+
   log "Volume cleanup complete. Backups in: ${BASE_DIR}/backups/"
 else
   log ">>> [5/12] Skipping cleanup (no --force flag)"
@@ -340,6 +385,12 @@ set -a
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
+
+# =============================================================================
+# FIX #1 & #3: Export DATABASE_PASSWORD for verify_postgres function
+# Ensure the password is available in all subshell contexts.
+# =============================================================================
+export DATABASE_PASSWORD
 
 # --------------------------- step 7: detect container UIDs ---------------------------
 log ">>> [7/12] Detecting container runtime UIDs/GIDs..."
@@ -378,7 +429,7 @@ log ">>> [9/12] Creating Docker volumes with bind mounts..."
 
 create_bind_volume() {
   local vol="$1" host_path="$2"
-  
+
   if docker volume inspect "${vol}" >/dev/null 2>&1; then
     log "Volume exists: ${vol}"
     return 0
@@ -428,7 +479,7 @@ gen_server_cert() {
     -addext "basicConstraints=critical,CA:FALSE" \
     -addext "keyUsage=digitalSignature,keyEncipherment" \
     -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
-  
+
   openssl x509 -in "${SERVER_CRT}" -noout -checkend 0 >/dev/null 2>&1 || die "Server cert validation failed"
 }
 
@@ -441,7 +492,7 @@ gen_mtls_ca() {
     -subj "/CN=EJBCA mTLS CA/O=EJBCA/OU=Operators" \
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
-  
+
   openssl x509 -in "${CA_CRT}" -noout -checkend 0 >/dev/null 2>&1 || die "mTLS CA cert validation failed"
 }
 
@@ -473,7 +524,7 @@ gen_superadmin_p12() {
     -passout "pass:${ADMIN_CLIENT_P12_PASSWORD}" >/dev/null 2>&1
 
   rm -f "${SUPERADMIN_CSR}" >/dev/null 2>&1 || true
-  
+
   openssl pkcs12 -in "${SUPERADMIN_P12}" -noout -passin "pass:${ADMIN_CLIENT_P12_PASSWORD}" >/dev/null 2>&1 || die "P12 validation failed"
 }
 
@@ -646,11 +697,12 @@ log ">>> [12/12] Writing docker-compose.yml..."
 COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
 backup_if_exists "${COMPOSE_FILE}"
 
+# FIX #4: Use container name constants in docker-compose.yml
 cat > "${COMPOSE_FILE}" <<EOF
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: ejbca-postgres
+    container_name: ${POSTGRES_CONTAINER}
     restart: unless-stopped
     user: "${PG_UID}:${PG_GID}"
     networks:
@@ -673,7 +725,7 @@ services:
 
   ejbca:
     image: keyfactor/ejbca-ce:\${EJBCA_IMAGE_TAG:-latest}
-    container_name: ejbca-app
+    container_name: ${EJBCA_CONTAINER}
     restart: unless-stopped
     networks:
       - ${DOCKER_NETWORK}
@@ -710,7 +762,7 @@ services:
       context: ${BASE_DIR}/nginx
       dockerfile: Dockerfile
     image: ejbca-nginx:local
-    container_name: ejbca-nginx
+    container_name: ${NGINX_CONTAINER}
     restart: unless-stopped
     networks:
       - ${DOCKER_NETWORK}
@@ -765,64 +817,281 @@ rollback() {
     return
   fi
   ROLLBACK_TRIGGERED=true
-  
+
   log "=== DEPLOYMENT FAILED: Initiating rollback ==="
-  
-  "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" logs --tail=100 || true
-  
+
+  # FIX #7: Use COMPOSE_CMD variable
+  "${RUN_AS_EJBCA[@]}" ${COMPOSE_CMD} --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" logs --tail=100 || true
+
   log "Stopping containers..."
-  "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" down || true
-  
+  "${RUN_AS_EJBCA[@]}" ${COMPOSE_CMD} --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" down || true
+
   LATEST_BACKUP=$(ls -t "${BASE_DIR}/backups"/volumes_* 2>/dev/null | head -1 || echo "")
   if [[ -n "${LATEST_BACKUP}" ]]; then
     log "Found volume backup: ${LATEST_BACKUP}"
     log "To restore: extract tarballs to ${BASE_DIR}/data/* and re-run script"
   fi
-  
+
   log "=== Rollback complete. Check ${LOG_FILE} for details ==="
   exit 1
 }
 trap 'rollback' ERR
 
 log "Building nginx image..."
-"${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" build --no-cache
+# FIX #7: Use COMPOSE_CMD variable
+"${RUN_AS_EJBCA[@]}" ${COMPOSE_CMD} --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" build --no-cache
 
 log "Starting containers..."
-"${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+"${RUN_AS_EJBCA[@]}" ${COMPOSE_CMD} --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
 
-# FIXED: Verify Postgres initialization by checking if container is healthy AND database is initialized
-log "Waiting for Postgres to initialize database..."
-ok=false
-for i in $(seq 1 60); do
-  # Check if container is healthy first
-  CONTAINER_HEALTH=$(docker inspect ejbca-postgres --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
-  if [[ "${CONTAINER_HEALTH}" == "healthy" ]]; then
-    # Now verify we can actually query the database
-    if docker exec ejbca-postgres psql -U ejbca -d ejbca -c "SELECT 1" >/dev/null 2>&1; then
-      ok=true
-      break
-    fi
+# ---------------------------------------------------------------------------
+# Postgres verification — robust, diagnostic-rich implementation
+# ---------------------------------------------------------------------------
+# Why this is non-trivial:
+#   - pg_isready (used by the Docker healthcheck) only checks that the
+#     postmaster is accepting connections. It does NOT authenticate and does
+#     NOT verify the target database exists.
+#   - With POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256", there is a
+#     window after pg_isready succeeds where password auth setup or the
+#     POSTGRES_DB creation is still in progress. During this window,
+#     `psql -U ejbca -d ejbca` can fail with:
+#       * FATAL: password authentication failed  (auth not yet configured)
+#       * FATAL: database "ejbca" does not exist  (initdb still running)
+#       * connection refused                      (brief restart after initdb)
+#   - `docker exec` with no timeout can hang if the postgres process is
+#     stalled (e.g. fsync on slow storage), consuming the entire retry budget.
+# ---------------------------------------------------------------------------
+
+verify_postgres() {
+  local max_attempts=90        # 90 * 2s = 180s (3 minutes) max wait
+  local sleep_interval=2
+  local exec_timeout=5         # seconds — per-attempt timeout for psql
+  # FIX #4: Use container name constant instead of hardcoded value
+  local container="${POSTGRES_CONTAINER}"
+
+  # =============================================================================
+  # FIX #1: Capture DATABASE_PASSWORD for psql authentication (CRITICAL FIX)
+  # The password is now passed via PGPASSWORD environment variable to docker exec.
+  # This fixes "fe_sendauth: no password supplied" errors.
+  # =============================================================================
+  local db_password="${DATABASE_PASSWORD:-}"
+  if [[ -z "${db_password}" ]]; then
+    log "ERROR: DATABASE_PASSWORD not set in environment"
+    return 1
   fi
-  sleep 2
-done
-"${ok}" || die "Postgres database initialization failed or timed out"
-log "Postgres database initialized and healthy"
+
+  log "Postgres verification: starting (max ${max_attempts} attempts, ${sleep_interval}s interval)"
+
+  local attempt=0
+  local last_error=""
+  local container_state=""
+  local container_health=""
+  local pg_ready_seen=false
+
+  while (( attempt < max_attempts )); do
+    attempt=$((attempt + 1))
+
+    # --- Phase 1: Check the container is running at all ---
+    container_state=$(docker inspect "${container}" --format='{{.State.Status}}' 2>/dev/null || echo "missing")
+    if [[ "${container_state}" != "running" ]]; then
+      if [[ "${container_state}" == "missing" ]]; then
+        log "Postgres verification [${attempt}/${max_attempts}]: container '${container}' not found"
+      else
+        log "Postgres verification [${attempt}/${max_attempts}]: container state=${container_state} (expected: running)"
+      fi
+      # If the container exited, grab exit code for diagnostics
+      if [[ "${container_state}" == "exited" ]]; then
+        local exit_code
+        exit_code=$(docker inspect "${container}" --format='{{.State.ExitCode}}' 2>/dev/null || echo "?")
+        log "Postgres verification: container exited with code ${exit_code}"
+        log "Postgres verification: last 30 lines of container logs:"
+        docker logs --tail=30 "${container}" 2>&1 | while IFS= read -r logline; do
+          log "  pg-log: ${logline}"
+        done
+        return 1
+      fi
+      sleep "${sleep_interval}"
+      continue
+    fi
+
+    # --- Phase 2: Check Docker healthcheck status ---
+    container_health=$(docker inspect "${container}" --format='{{.State.Health.Status}}' 2>/dev/null || echo "none")
+
+    # Log health transitions
+    if [[ "${container_health}" == "healthy" && "${pg_ready_seen}" == false ]]; then
+      pg_ready_seen=true
+      log "Postgres verification [${attempt}/${max_attempts}]: Docker healthcheck reports healthy (pg_isready OK)"
+      log "Postgres verification: now verifying authenticated database access..."
+    fi
+
+    # --- Phase 3: Attempt authenticated psql query with timeout ---
+    # Use 'timeout' to prevent docker exec from hanging indefinitely.
+    # Pass PGCONNECT_TIMEOUT as a secondary safeguard inside the container.
+    # =============================================================================
+    # FIX #1: Add PGPASSWORD to docker exec command (CRITICAL FIX)
+    # The -e PGPASSWORD="${db_password}" passes the password to psql via env var.
+    # =============================================================================
+    local psql_output=""
+    local psql_exit=0
+    psql_output=$(timeout "${exec_timeout}" \
+      docker exec -e PGCONNECT_TIMEOUT=3 -e PGPASSWORD="${db_password}" "${container}" \
+        psql -U ejbca -d ejbca -w -c "SELECT 1 AS connectivity_check" 2>&1) || psql_exit=$?
+
+    if [[ ${psql_exit} -eq 0 ]]; then
+      log "Postgres verification [${attempt}/${max_attempts}]: SUCCESS — authenticated query returned OK"
+      log "Postgres verification: health=${container_health}, total wait=$((attempt * sleep_interval))s"
+      return 0
+    fi
+
+    # --- Phase 4: Classify the failure for diagnostics ---
+    last_error="${psql_output}"
+
+    # Timeout from the 'timeout' command itself (exit code 124)
+    if [[ ${psql_exit} -eq 124 ]]; then
+      log "Postgres verification [${attempt}/${max_attempts}]: psql timed out after ${exec_timeout}s (health=${container_health})"
+    # Log at intervals to avoid flooding, but always log the first few attempts
+    elif (( attempt <= 3 || attempt % 10 == 0 )); then
+      # Sanitize multi-line output to single line for log readability
+      local short_error
+      short_error=$(echo "${psql_output}" | tr '\n' ' ' | head -c 200)
+      log "Postgres verification [${attempt}/${max_attempts}]: psql failed (exit=${psql_exit}, health=${container_health}): ${short_error}"
+    fi
+
+    sleep "${sleep_interval}"
+  done
+
+  # --- Verification failed: dump full diagnostics ---
+  log ""
+  log "========== POSTGRES VERIFICATION FAILED =========="
+  log "Gave up after ${max_attempts} attempts ($(( max_attempts * sleep_interval ))s)"
+  log "Last container state: ${container_state}"
+  log "Last healthcheck status: ${container_health}"
+  log "Last psql error: ${last_error}"
+  log ""
+
+  # =============================================================================
+  # FIX #2: Check jq availability before using it (CRITICAL FIX)
+  # Provides fallback output if jq is not installed.
+  # =============================================================================
+  log "--- Container inspect (health log) ---"
+  if [[ "${JQ_AVAILABLE}" == true ]]; then
+    docker inspect "${container}" --format='{{json .State.Health}}' 2>/dev/null | jq -r '.Log[-5:][] | "\(.Start) exit=\(.ExitCode) out=\(.Output)"' 2>/dev/null | while IFS= read -r hline; do
+      log "  health-log: ${hline}"
+    done
+  else
+    # Fallback: show raw JSON health info without jq parsing
+    log "  (jq not available, showing raw health JSON)"
+    docker inspect "${container}" --format='{{json .State.Health}}' 2>/dev/null | head -c 1000 | while IFS= read -r hline; do
+      log "  health-log: ${hline}"
+    done
+  fi
+
+  log ""
+  log "--- Container logs (last 50 lines) ---"
+  docker logs --tail=50 "${container}" 2>&1 | while IFS= read -r logline; do
+    log "  pg-log: ${logline}"
+  done
+  log ""
+
+  # =============================================================================
+  # FIX #3: Check if pg_hba.conf exists before reading it (MAJOR FIX)
+  # The file may not exist during early Postgres initialization.
+  # =============================================================================
+  log "--- pg_hba.conf (if accessible) ---"
+  if timeout 3 docker exec "${container}" test -f /var/lib/postgresql/data/pg_hba.conf 2>/dev/null; then
+    timeout 3 docker exec "${container}" cat /var/lib/postgresql/data/pg_hba.conf 2>&1 | tail -20 | while IFS= read -r hbaline; do
+      log "  pg_hba: ${hbaline}"
+    done
+  else
+    log "  pg_hba: file not yet created (initialization may still be in progress)"
+  fi
+  log ""
+
+  # =============================================================================
+  # FIX #5: Add test guards for additional diagnostic commands (MAJOR FIX)
+  # Check container accessibility before running diagnostic commands.
+  # =============================================================================
+  log "--- Postgres config checks ---"
+  if timeout 3 docker exec "${container}" pg_isready -U ejbca -d ejbca -h 127.0.0.1 2>&1 >/dev/null; then
+    timeout 3 docker exec "${container}" pg_isready -U ejbca -d ejbca -h 127.0.0.1 2>&1 | while IFS= read -r rdyline; do
+      log "  pg_isready: ${rdyline}"
+    done
+  else
+    log "  pg_isready: command failed or timed out"
+  fi
+  log ""
+
+  # FIX #1: Add PGPASSWORD to diagnostic psql calls
+  log "--- Postgres user/database listing ---"
+  if timeout 3 docker exec -e PGPASSWORD="${db_password}" "${container}" psql -U postgres -c "\\du" 2>&1 >/dev/null; then
+    timeout 3 docker exec -e PGPASSWORD="${db_password}" "${container}" psql -U postgres -c "\\du" 2>&1 | while IFS= read -r uline; do
+      log "  pg-users: ${uline}"
+    done
+  else
+    log "  pg-users: command failed or timed out"
+  fi
+
+  if timeout 3 docker exec -e PGPASSWORD="${db_password}" "${container}" psql -U postgres -c "\\l" 2>&1 >/dev/null; then
+    timeout 3 docker exec -e PGPASSWORD="${db_password}" "${container}" psql -U postgres -c "\\l" 2>&1 | while IFS= read -r dbline; do
+      log "  pg-databases: ${dbline}"
+    done
+  else
+    log "  pg-databases: command failed or timed out"
+  fi
+
+  log "========== END POSTGRES DIAGNOSTICS =========="
+  log ""
+  return 1
+}
+
+verify_postgres || die "Postgres database initialization failed — see diagnostic output above"
+log "Postgres database initialized and verified"
+
+# =============================================================================
+# FIX #6: EJBCA Database Schema Verification (OPTIONAL ENHANCEMENT)
+# After EJBCA reports healthy, verify tables were actually created.
+# This provides an additional sanity check that EJBCA initialized properly.
+# =============================================================================
+verify_ejbca_schema() {
+  local container="${POSTGRES_CONTAINER}"
+  local db_password="${DATABASE_PASSWORD:-}"
+  
+  log "Verifying EJBCA database schema..."
+  
+  local table_count=""
+  table_count=$(timeout 5 docker exec -e PGPASSWORD="${db_password}" "${container}" \
+    psql -U ejbca -d ejbca -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'" 2>/dev/null | tr -d ' ' || echo "0")
+  
+  if [[ -n "${table_count}" && "${table_count}" -gt 0 ]]; then
+    log "EJBCA schema verified: ${table_count} tables found in public schema"
+    return 0
+  else
+    log "WARNING: EJBCA schema may not be fully initialized (found ${table_count:-0} tables)"
+    return 1
+  fi
+}
 
 # Verify EJBCA bootstrap
-log "Waiting for EJBCA to complete bootstrap (this may take 2-3 minutes)..."
+log "Waiting for EJBCA to complete bootstrap (this may take several minutes)..."
 ok=false
+# FIX #4: Use container name constant
 for i in $(seq 1 120); do
-  if docker exec ejbca-app curl -sf http://127.0.0.1:8080/ejbca/publicweb/healthcheck/ejbcahealth 2>/dev/null | grep -q "ALLOK"; then
+  if docker exec "${EJBCA_CONTAINER}" curl -sf http://127.0.0.1:8080/ejbca/publicweb/healthcheck/ejbcahealth 2>/dev/null | grep -q "ALLOK"; then
     ok=true
     break
   fi
   sleep 3
   if (( i % 10 == 0 )); then
-    log "Still waiting for EJBCA bootstrap... ($i/120)"
+    # FIX #4: Use container name constant
+    EJBCA_HEALTH=$(docker inspect "${EJBCA_CONTAINER}" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+    log "Still waiting for EJBCA bootstrap... (${i}/120, health=${EJBCA_HEALTH})"
   fi
 done
 "${ok}" || die "EJBCA bootstrap failed or timed out"
 log "EJBCA application is healthy"
+
+# FIX #6: Run schema verification after EJBCA is healthy (non-fatal warning)
+verify_ejbca_schema || log "Note: Schema verification returned a warning, but EJBCA healthcheck passed"
 
 # Verify nginx can reach backend
 log "Waiting for nginx reverse proxy..."
@@ -863,7 +1132,8 @@ if [[ "${MTLS_TEST}" == "200" || "${MTLS_TEST}" == "302" ]]; then
   log "INITIAL_ADMIN from docker-compose.yml and recreate ejbca container:"
   log "  cd ${BASE_DIR}"
   log "  # Edit docker-compose.yml and remove INITIAL_ADMIN line"
-  log "  docker compose --env-file .env up -d --force-recreate ejbca"
+  # FIX #7: Use COMPOSE_CMD in instructions
+  log "  ${COMPOSE_CMD} --env-file .env up -d --force-recreate ejbca"
   log "=================================================================="
 elif [[ "${MTLS_TEST}" == "403" ]]; then
   log "WARNING: mTLS cert presented but admin role not yet configured in EJBCA"
@@ -875,7 +1145,8 @@ fi
 
 trap - ERR
 
-docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'ejbca-(postgres|app|nginx)' || true
+# FIX #4: Use container name constants in status display
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E "(${POSTGRES_CONTAINER}|${EJBCA_CONTAINER}|${NGINX_CONTAINER})" || true
 
 log ""
 log "=================================================================="
@@ -903,9 +1174,10 @@ log "  3. Configure admin roles and end entities"
 log "  4. Remove INITIAL_ADMIN from compose file and recreate ejbca container"
 log ""
 log "Management:"
-log "  View logs:     cd ${BASE_DIR} && docker compose logs -f"
-log "  Stop:          cd ${BASE_DIR} && docker compose down"
-log "  Start:         cd ${BASE_DIR} && docker compose up -d"
+# FIX #7: Use COMPOSE_CMD in management instructions
+log "  View logs:     cd ${BASE_DIR} && ${COMPOSE_CMD} logs -f"
+log "  Stop:          cd ${BASE_DIR} && ${COMPOSE_CMD} down"
+log "  Start:         cd ${BASE_DIR} && ${COMPOSE_CMD} up -d"
 log "  Backup:        Backup ${BASE_DIR}/data/* and ${BASE_DIR}/.env"
 log ""
 log "Setup log: ${LOG_FILE}"
