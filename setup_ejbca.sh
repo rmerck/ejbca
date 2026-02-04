@@ -2,31 +2,13 @@
 ###############################################################################
 # setup_ejbca.sh — Reproducible EJBCA CE + Postgres + Nginx (TLS+mTLS) on Debian 13
 #
-# Hardened version addressing all critical deployment gaps:
-#   - Docker daemon readiness verification
-#   - Explicit network creation with isolation
-#   - SELinux/AppArmor compatibility checks
-#   - Complete initialization verification (Postgres + EJBCA bootstrap)
-#   - DNS/hostname resolution validation
-#   - Proper cleanup ordering for --force
-#   - Firewall detection and configuration
-#   - Safe password generation (alphanumeric only)
-#   - Disk space verification
-#   - Certificate validation
-#   - EJBCA admin role verification before INITIAL_ADMIN removal warning
-#   - Complete rollback with volume restoration
+# Hardened version with fixed Postgres verification logic
 #
 # Usage:
 #   sudo ./setup_ejbca.sh
 #   sudo ./setup_ejbca.sh --force --yes
 #   sudo ./setup_ejbca.sh --hostname pki.example.com
 #   sudo ./setup_ejbca.sh --image-tag latest
-#
-# Flags:
-#   --force     Regenerate artifacts + recreate volumes (DATA LOSS after backup)
-#   --yes       Skip confirmation delay when using --force
-#   --hostname  Override HTTPSERVER_HOSTNAME + server cert CN/SAN (DNS only)
-#   --image-tag EJBCA image tag (default: latest)
 #
 ###############################################################################
 
@@ -46,7 +28,6 @@ OPT_YES=false
 OPT_HOSTNAME=""
 OPT_IMAGE_TAG="latest"
 
-# Minimum disk space required (in MB)
 MIN_DISK_SPACE_MB=5000
 
 usage() {
@@ -134,7 +115,6 @@ default_fqdn() {
   echo "$h"
 }
 
-# Safe password generation (alphanumeric only, no special chars for JDBC)
 rand_alnum_32() {
   LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32
 }
@@ -152,22 +132,18 @@ if [[ -n "${AVAILABLE_MB}" ]] && (( AVAILABLE_MB < MIN_DISK_SPACE_MB )); then
 fi
 log "Disk space check: ${AVAILABLE_MB}MB available (minimum: ${MIN_DISK_SPACE_MB}MB)"
 
-# Check ports
 if port_in_use 80 || port_in_use 443; then
   die "Ports 80/443 are already in use. Stop the service using them and re-run."
 fi
 
-# Determine hostname early for DNS validation
 CERT_HOST="${OPT_HOSTNAME:-$(default_fqdn)}"
 log "Using hostname: ${CERT_HOST}"
 
-# Validate hostname resolves
 if ! host "${CERT_HOST}" >/dev/null 2>&1 && ! grep -q "${CERT_HOST}" /etc/hosts; then
   log "WARNING: Hostname '${CERT_HOST}' does not resolve. Add to /etc/hosts or DNS."
   log "Continuing anyway, but TLS validation may fail for clients."
 fi
 
-# Force confirmation
 if "${OPT_FORCE}"; then
   log "WARNING: --force will:"
   log "  - Stop and remove all containers"
@@ -221,7 +197,6 @@ retry_backoff 3 apt-get install -y docker-ce docker-ce-cli containerd.io docker-
 systemctl enable docker || die "Failed to enable docker"
 systemctl start docker || die "Failed to start docker"
 
-# Wait for Docker daemon to be fully ready
 log "Waiting for Docker daemon to be ready..."
 retry_backoff 10 docker info >/dev/null 2>&1 || die "Docker daemon did not become ready"
 
@@ -309,21 +284,17 @@ if "${OPT_FORCE}"; then
   if [[ -f "${COMPOSE_FILE_TMP}" ]]; then
     RUN_AS_EJBCA=(sudo -u "${EJBCA_USER}" env HOME="${EJBCA_HOME}" DOCKER_CONFIG="${DOCKER_CONFIG_DIR}")
     
-    # Stop and remove containers
     log "Stopping all containers..."
     "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE_TMP}" -f "${COMPOSE_FILE_TMP}" down -v 2>/dev/null || true
     
-    # Give Docker time to release volumes
     sleep 3
   fi
   
-  # Backup and remove volumes
   for vol in ejbca_pgdata ejbca_data ejbca_logs; do
     if docker volume inspect "${vol}" >/dev/null 2>&1; then
       BACKUP_DIR="${BASE_DIR}/backups/volumes_$(ts_suffix)"
       mkdir -p "${BACKUP_DIR}"
       
-      # Get volume mount point
       VOL_PATH=$(docker volume inspect "${vol}" --format '{{ .Options.device }}' 2>/dev/null || echo "")
       if [[ -n "${VOL_PATH}" && -d "${VOL_PATH}" ]]; then
         log "Backing up volume ${vol} from ${VOL_PATH}..."
@@ -384,7 +355,6 @@ log "Detected Postgres UID:GID = ${PG_UID}:${PG_GID}"
 EJBCA_UID="$(docker run --rm "keyfactor/ejbca-ce:${OPT_IMAGE_TAG}" sh -lc 'id -u 2>/dev/null || echo 10001' 2>/dev/null || echo '10001')"
 log "Detected/assumed EJBCA UID = ${EJBCA_UID}"
 
-# Cleanup detection containers
 docker container prune -f >/dev/null 2>&1 || true
 
 # --------------------------- step 8: create docker network ---------------------------
@@ -423,7 +393,6 @@ create_bind_volume "ejbca_pgdata" "${BASE_DIR}/data/postgres"
 create_bind_volume "ejbca_data"   "${BASE_DIR}/data/ejbca"
 create_bind_volume "ejbca_logs"   "${BASE_DIR}/logs"
 
-# Set ownership
 chown -R "${PG_UID}:${PG_GID}" "${BASE_DIR}/data/postgres"
 chmod 700 "${BASE_DIR}/data/postgres"
 
@@ -460,7 +429,6 @@ gen_server_cert() {
     -addext "keyUsage=digitalSignature,keyEncipherment" \
     -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
   
-  # Validate
   openssl x509 -in "${SERVER_CRT}" -noout -checkend 0 >/dev/null 2>&1 || die "Server cert validation failed"
 }
 
@@ -474,7 +442,6 @@ gen_mtls_ca() {
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
   
-  # Validate
   openssl x509 -in "${CA_CRT}" -noout -checkend 0 >/dev/null 2>&1 || die "mTLS CA cert validation failed"
 }
 
@@ -507,7 +474,6 @@ gen_superadmin_p12() {
 
   rm -f "${SUPERADMIN_CSR}" >/dev/null 2>&1 || true
   
-  # Validate P12
   openssl pkcs12 -in "${SUPERADMIN_P12}" -noout -passin "pass:${ADMIN_CLIENT_P12_PASSWORD}" >/dev/null 2>&1 || die "P12 validation failed"
 }
 
@@ -553,7 +519,6 @@ cat > "${NGINX_DOCKERFILE}" <<'EOF'
 FROM nginx:1.27-alpine
 RUN apk add --no-cache curl
 
-# Configure log rotation
 RUN cat > /etc/logrotate.d/nginx <<'LOGROTATE'
 /var/log/nginx/*.log {
     daily
@@ -808,7 +773,6 @@ rollback() {
   log "Stopping containers..."
   "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" down || true
   
-  # Check for volume backups
   LATEST_BACKUP=$(ls -t "${BASE_DIR}/backups"/volumes_* 2>/dev/null | head -1 || echo "")
   if [[ -n "${LATEST_BACKUP}" ]]; then
     log "Found volume backup: ${LATEST_BACKUP}"
@@ -820,31 +784,35 @@ rollback() {
 }
 trap 'rollback' ERR
 
-# Build and start
 log "Building nginx image..."
 "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" build --no-cache
 
 log "Starting containers..."
 "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
 
-# Verify Postgres initialization
+# FIXED: Verify Postgres initialization by checking if container is healthy AND database is initialized
 log "Waiting for Postgres to initialize database..."
 ok=false
 for i in $(seq 1 60); do
-  if docker exec ejbca-postgres psql -U ejbca -d ejbca -c "SELECT 1" >/dev/null 2>&1; then
-    ok=true
-    break
+  # Check if container is healthy first
+  CONTAINER_HEALTH=$(docker inspect ejbca-postgres --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+  if [[ "${CONTAINER_HEALTH}" == "healthy" ]]; then
+    # Now verify we can actually query the database
+    if docker exec ejbca-postgres psql -U ejbca -d ejbca -c "SELECT 1" >/dev/null 2>&1; then
+      ok=true
+      break
+    fi
   fi
   sleep 2
 done
-"${ok}" || die "Postgres database initialization failed"
-log "Postgres database initialized"
+"${ok}" || die "Postgres database initialization failed or timed out"
+log "Postgres database initialized and healthy"
 
 # Verify EJBCA bootstrap
 log "Waiting for EJBCA to complete bootstrap (this may take 2-3 minutes)..."
 ok=false
 for i in $(seq 1 120); do
-  if docker exec ejbca-app curl -sf http://127.0.0.1:8080/ejbca/publicweb/healthcheck/ejbcahealth | grep -q "ALLOK" 2>/dev/null; then
+  if docker exec ejbca-app curl -sf http://127.0.0.1:8080/ejbca/publicweb/healthcheck/ejbcahealth 2>/dev/null | grep -q "ALLOK"; then
     ok=true
     break
   fi
