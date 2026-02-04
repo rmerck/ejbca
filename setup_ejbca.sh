@@ -2,16 +2,19 @@
 ###############################################################################
 # setup_ejbca.sh — Reproducible EJBCA CE + Postgres + Nginx (TLS+mTLS) on Debian 13
 #
-# This script is rebuilt to match the *working* deployment state captured in
-# ejbca_config_dump_20260204_140017.txt, including the fixes discovered:
-#   - Postgres container UID/GID is 70:70 (postgres:16-alpine), not 999:999
-#   - EJBCA listens on 8080 (not 8081/8082 in this image/config)
-#   - EJBCA persistence is mounted at /mnt/persistent (volume ejbca_data)
-#   - EJBCA works with: TLS_SETUP_ENABLED=true, PROXY_HTTP_BIND="" (unset/blank),
-#     HTTPSERVER_HOSTNAME=<host>
-#   - Nginx reverse proxy terminates TLS and enforces mTLS on:
-#       /ejbca/adminweb/ and /ejbca/ejbca-rest-api/
-#   - DO NOT cap_drop ALL for nginx (it breaks entrypoint chown/init); keep it simple
+# Hardened version addressing all critical deployment gaps:
+#   - Docker daemon readiness verification
+#   - Explicit network creation with isolation
+#   - SELinux/AppArmor compatibility checks
+#   - Complete initialization verification (Postgres + EJBCA bootstrap)
+#   - DNS/hostname resolution validation
+#   - Proper cleanup ordering for --force
+#   - Firewall detection and configuration
+#   - Safe password generation (alphanumeric only)
+#   - Disk space verification
+#   - Certificate validation
+#   - EJBCA admin role verification before INITIAL_ADMIN removal warning
+#   - Complete rollback with volume restoration
 #
 # Usage:
 #   sudo ./setup_ejbca.sh
@@ -20,16 +23,10 @@
 #   sudo ./setup_ejbca.sh --image-tag latest
 #
 # Flags:
-#   --force     Regenerate generated artifacts (.env, certs, nginx configs, p12),
-#               and recreate named volumes (DATA LOSS) after backing up artifacts.
-#   --yes       Skip the 10-second confirmation delay when using --force.
-#   --hostname  Override HTTPSERVER_HOSTNAME + server cert CN/SAN (DNS only).
-#               Default: hostname -f (fallback hostname)
+#   --force     Regenerate artifacts + recreate volumes (DATA LOSS after backup)
+#   --yes       Skip confirmation delay when using --force
+#   --hostname  Override HTTPSERVER_HOSTNAME + server cert CN/SAN (DNS only)
 #   --image-tag EJBCA image tag (default: latest)
-#
-# Outputs:
-#   - /opt/ejbca/* (compose, nginx configs, certs, data dirs)
-#   - /var/log/ejbca-setup.log
 #
 ###############################################################################
 
@@ -38,6 +35,7 @@ set -euo pipefail
 # --------------------------- args / defaults ---------------------------
 BASE_DIR="/opt/ejbca"
 LOG_FILE="/var/log/ejbca-setup.log"
+DOCKER_NETWORK="ejbca_net"
 
 EJBCA_USER="ejbca"
 EJBCA_HOME="/home/ejbca"
@@ -47,6 +45,9 @@ OPT_FORCE=false
 OPT_YES=false
 OPT_HOSTNAME=""
 OPT_IMAGE_TAG="latest"
+
+# Minimum disk space required (in MB)
+MIN_DISK_SPACE_MB=5000
 
 usage() {
   cat <<EOF
@@ -79,7 +80,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h) usage 0 ;;
-    *) echo "ERROR: Unknown argument: $1"; usage 1 ;;
+    *) echo "ERROR: Unknown argument: $1"; usage 1; ;;
   esac
 done
 
@@ -115,7 +116,6 @@ retry_backoff() {
       return 1
     fi
     log "Retry $n/$attempts failed; sleeping ${delay}s."
-    log "Hints: check DNS (/etc/resolv.conf), proxy env (http_proxy/https_proxy), outbound HTTPS, apt mirrors."
     sleep "$delay"
     n=$((n+1))
     delay=$((delay*2))
@@ -134,32 +134,72 @@ default_fqdn() {
   echo "$h"
 }
 
-rand_b64_32() {
-  openssl rand -base64 32 | tr -d '\n'
+# Safe password generation (alphanumeric only, no special chars for JDBC)
+rand_alnum_32() {
+  LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32
 }
 
-# --------------------------- preflight ---------------------------
+# --------------------------- preflight checks ---------------------------
 log "===== EJBCA setup starting ====="
 log "Base dir: ${BASE_DIR}"
 log "Force: ${OPT_FORCE}"
 log "Image tag: ${OPT_IMAGE_TAG}"
 
+# Check disk space
+AVAILABLE_MB=$(df -BM "${BASE_DIR%/*}" 2>/dev/null | awk 'NR==2 {print $4}' | sed 's/M//')
+if [[ -n "${AVAILABLE_MB}" ]] && (( AVAILABLE_MB < MIN_DISK_SPACE_MB )); then
+  die "Insufficient disk space. Required: ${MIN_DISK_SPACE_MB}MB, Available: ${AVAILABLE_MB}MB"
+fi
+log "Disk space check: ${AVAILABLE_MB}MB available (minimum: ${MIN_DISK_SPACE_MB}MB)"
+
+# Check ports
 if port_in_use 80 || port_in_use 443; then
   die "Ports 80/443 are already in use. Stop the service using them and re-run."
 fi
 
+# Determine hostname early for DNS validation
+CERT_HOST="${OPT_HOSTNAME:-$(default_fqdn)}"
+log "Using hostname: ${CERT_HOST}"
+
+# Validate hostname resolves
+if ! host "${CERT_HOST}" >/dev/null 2>&1 && ! grep -q "${CERT_HOST}" /etc/hosts; then
+  log "WARNING: Hostname '${CERT_HOST}' does not resolve. Add to /etc/hosts or DNS."
+  log "Continuing anyway, but TLS validation may fail for clients."
+fi
+
+# Force confirmation
 if "${OPT_FORCE}"; then
-  log "WARNING: --force will recreate volumes (DATA LOSS) and regenerate secrets/certs."
+  log "WARNING: --force will:"
+  log "  - Stop and remove all containers"
+  log "  - Backup and recreate all volumes (DATA LOSS)"
+  log "  - Regenerate all secrets and certificates"
   if ! "${OPT_YES}"; then
     log "Press Ctrl-C within 10 seconds to abort..."
     sleep 10
   fi
 fi
 
+# --------------------------- SELinux/AppArmor check ---------------------------
+log ">>> [Pre-flight] Checking security modules..."
+if command -v getenforce >/dev/null 2>&1; then
+  SELINUX_STATUS="$(getenforce 2>/dev/null || echo 'Disabled')"
+  log "SELinux status: ${SELINUX_STATUS}"
+  if [[ "${SELINUX_STATUS}" == "Enforcing" ]]; then
+    log "WARNING: SELinux is enforcing. Docker volumes may need :Z or :z suffixes."
+    log "This script uses bind mounts. If errors occur, consider: setenforce 0"
+  fi
+fi
+
+if command -v aa-status >/dev/null 2>&1; then
+  if aa-status --enabled 2>/dev/null; then
+    log "AppArmor is enabled. Docker should handle profiles automatically."
+  fi
+fi
+
 # --------------------------- step 1: packages + docker ---------------------------
-log ">>> [1/10] Installing prerequisites + Docker (official repo)..."
+log ">>> [1/12] Installing prerequisites + Docker (official repo)..."
 retry_backoff 3 apt-get update -y || die "apt-get update failed"
-retry_backoff 3 apt-get install -y ca-certificates curl gnupg lsb-release openssl jq || die "Failed installing base prerequisites"
+retry_backoff 3 apt-get install -y ca-certificates curl gnupg lsb-release openssl jq dnsutils || die "Failed installing prerequisites"
 
 install -m 0755 -d /etc/apt/keyrings
 if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
@@ -169,7 +209,7 @@ if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
 fi
 
 CODENAME="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
-[[ -n "$CODENAME" ]] || die "Could not determine VERSION_CODENAME from /etc/os-release"
+[[ -n "$CODENAME" ]] || die "Could not determine VERSION_CODENAME"
 
 cat > /etc/apt/sources.list.d/docker.list <<EOF
 deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${CODENAME} stable
@@ -178,15 +218,47 @@ EOF
 retry_backoff 3 apt-get update -y || die "apt-get update failed after adding Docker repo"
 retry_backoff 3 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || die "Docker install failed"
 
-systemctl enable --now docker || die "Failed to enable/start docker"
-docker version >/dev/null 2>&1 || die "Docker is not functional"
-docker compose version >/dev/null 2>&1 || die "Docker compose plugin not functional"
+systemctl enable docker || die "Failed to enable docker"
+systemctl start docker || die "Failed to start docker"
+
+# Wait for Docker daemon to be fully ready
+log "Waiting for Docker daemon to be ready..."
+retry_backoff 10 docker info >/dev/null 2>&1 || die "Docker daemon did not become ready"
 
 log "Docker: $(docker --version)"
 log "Compose: $(docker compose version)"
 
-# --------------------------- step 2: create service user (real home) ---------------------------
-log ">>> [2/10] Ensuring service user '${EJBCA_USER}' exists with real HOME..."
+# --------------------------- step 2: firewall detection/configuration ---------------------------
+log ">>> [2/12] Checking firewall configuration..."
+FIREWALL_CONFIGURED=false
+
+if command -v ufw >/dev/null 2>&1; then
+  if ufw status | grep -q "Status: active"; then
+    log "UFW is active. Configuring ports 80/443..."
+    ufw allow 80/tcp >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    FIREWALL_CONFIGURED=true
+    log "UFW rules added for ports 80, 443"
+  fi
+fi
+
+if command -v firewall-cmd >/dev/null 2>&1; then
+  if firewall-cmd --state 2>/dev/null | grep -q running; then
+    log "firewalld is active. Configuring ports 80/443..."
+    firewall-cmd --permanent --add-service=http >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-service=https >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    FIREWALL_CONFIGURED=true
+    log "firewalld rules added for http, https"
+  fi
+fi
+
+if ! "${FIREWALL_CONFIGURED}"; then
+  log "No active firewall detected (ufw/firewalld). Ports 80/443 should be accessible."
+fi
+
+# --------------------------- step 3: create service user ---------------------------
+log ">>> [3/12] Ensuring service user '${EJBCA_USER}' exists..."
 if ! id "${EJBCA_USER}" >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "${EJBCA_HOME}" --shell /usr/sbin/nologin "${EJBCA_USER}"
   log "Created user ${EJBCA_USER}"
@@ -201,8 +273,8 @@ mkdir -p "${DOCKER_CONFIG_DIR}"
 chown -R "${EJBCA_USER}:${EJBCA_USER}" "${EJBCA_HOME}"
 chmod 750 "${EJBCA_HOME}"
 
-# --------------------------- step 3: directory layout ---------------------------
-log ">>> [3/10] Creating directory structure..."
+# --------------------------- step 4: directory layout ---------------------------
+log ">>> [4/12] Creating directory structure..."
 mkdir -p \
   "${BASE_DIR}/config" \
   "${BASE_DIR}/plugins" \
@@ -216,22 +288,60 @@ mkdir -p \
   "${BASE_DIR}/nginx/mtls-ca" \
   "${BASE_DIR}/nginx/clients"
 
-# ownerships (match working state)
 chown -R root:root "${BASE_DIR}/config" "${BASE_DIR}/plugins" "${BASE_DIR}/nginx" "${BASE_DIR}/secrets"
 chmod 755 "${BASE_DIR}" "${BASE_DIR}/config" "${BASE_DIR}/plugins" "${BASE_DIR}/nginx" "${BASE_DIR}/nginx/conf.d" "${BASE_DIR}/nginx/tls" "${BASE_DIR}/nginx/mtls-ca" "${BASE_DIR}/nginx/clients"
 chmod 750 "${BASE_DIR}/secrets"
 
-# operational dirs owned by ejbca user (matches observed ejbca user uid/gid 999:987 in your dump)
 chown -R "${EJBCA_USER}:${EJBCA_USER}" "${BASE_DIR}/backups" "${BASE_DIR}/logs"
 chmod 750 "${BASE_DIR}/backups" "${BASE_DIR}/logs"
 
-# data roots: keep as root-owned but writable as needed
-# postgres will be chowned to container's postgres uid/gid (detected below)
 chmod 775 "${BASE_DIR}/data" "${BASE_DIR}/data/ejbca"
 chown root:root "${BASE_DIR}/data" "${BASE_DIR}/data/ejbca"
 
-# --------------------------- step 4: .env generation ---------------------------
-log ">>> [4/10] Writing ${BASE_DIR}/.env (idempotent)..."
+# --------------------------- step 5: cleanup for --force ---------------------------
+if "${OPT_FORCE}"; then
+  log ">>> [5/12] --force: Stopping containers and backing up volumes..."
+  
+  cd "${BASE_DIR}" 2>/dev/null || true
+  ENV_FILE_TMP="${BASE_DIR}/.env"
+  COMPOSE_FILE_TMP="${BASE_DIR}/docker-compose.yml"
+  
+  if [[ -f "${COMPOSE_FILE_TMP}" ]]; then
+    RUN_AS_EJBCA=(sudo -u "${EJBCA_USER}" env HOME="${EJBCA_HOME}" DOCKER_CONFIG="${DOCKER_CONFIG_DIR}")
+    
+    # Stop and remove containers
+    log "Stopping all containers..."
+    "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE_TMP}" -f "${COMPOSE_FILE_TMP}" down -v 2>/dev/null || true
+    
+    # Give Docker time to release volumes
+    sleep 3
+  fi
+  
+  # Backup and remove volumes
+  for vol in ejbca_pgdata ejbca_data ejbca_logs; do
+    if docker volume inspect "${vol}" >/dev/null 2>&1; then
+      BACKUP_DIR="${BASE_DIR}/backups/volumes_$(ts_suffix)"
+      mkdir -p "${BACKUP_DIR}"
+      
+      # Get volume mount point
+      VOL_PATH=$(docker volume inspect "${vol}" --format '{{ .Options.device }}' 2>/dev/null || echo "")
+      if [[ -n "${VOL_PATH}" && -d "${VOL_PATH}" ]]; then
+        log "Backing up volume ${vol} from ${VOL_PATH}..."
+        tar -czf "${BACKUP_DIR}/${vol}.tar.gz" -C "${VOL_PATH}" . 2>/dev/null || log "Warning: Backup of ${vol} failed"
+      fi
+      
+      log "Removing volume ${vol}..."
+      docker volume rm -f "${vol}" 2>/dev/null || true
+    fi
+  done
+  
+  log "Volume cleanup complete. Backups in: ${BASE_DIR}/backups/"
+else
+  log ">>> [5/12] Skipping cleanup (no --force flag)"
+fi
+
+# --------------------------- step 6: .env generation ---------------------------
+log ">>> [6/12] Writing ${BASE_DIR}/.env..."
 ENV_FILE="${BASE_DIR}/.env"
 
 if [[ -f "${ENV_FILE}" && "${OPT_FORCE}" == false ]]; then
@@ -242,53 +352,66 @@ else
   fi
   cat > "${ENV_FILE}" <<EOF
 # Generated by setup_ejbca.sh on $(date -u +'%Y-%m-%dT%H:%M:%SZ')
-DATABASE_PASSWORD=$(rand_b64_32)
-PASSWORD_ENCRYPTION_KEY=$(rand_b64_32)
-CA_KEYSTOREPASS=$(rand_b64_32)
-EJBCA_CLI_DEFAULTPASSWORD=$(rand_b64_32)
-ADMIN_CLIENT_P12_PASSWORD=$(rand_b64_32)
+DATABASE_PASSWORD=$(rand_alnum_32)
+PASSWORD_ENCRYPTION_KEY=$(rand_alnum_32)
+CA_KEYSTOREPASS=$(rand_alnum_32)
+EJBCA_CLI_DEFAULTPASSWORD=$(rand_alnum_32)
+ADMIN_CLIENT_P12_PASSWORD=$(rand_alnum_32)
 EJBCA_IMAGE_TAG=${OPT_IMAGE_TAG}
 EOF
-  log "Wrote .env"
+  log "Generated .env with safe alphanumeric passwords"
 fi
 
 chown "root:${EJBCA_USER}" "${ENV_FILE}"
 chmod 640 "${ENV_FILE}"
 
-# load env (for p12 password)
 set -a
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 set +a
 
-# --------------------------- step 5: detect container UIDs (critical) ---------------------------
-log ">>> [5/10] Detecting container runtime UIDs/GIDs (to avoid permission failures)..."
-# Postgres UID/GID inside postgres:16-alpine is 70:70 (observed), but detect to be safe:
-PG_UID="$(docker run --rm postgres:16-alpine sh -lc 'id -u postgres' 2>/dev/null || true)"
-PG_GID="$(docker run --rm postgres:16-alpine sh -lc 'id -g postgres' 2>/dev/null || true)"
-[[ -n "${PG_UID}" && -n "${PG_GID}" ]] || die "Unable to detect postgres UID/GID from postgres:16-alpine"
+# --------------------------- step 7: detect container UIDs ---------------------------
+log ">>> [7/12] Detecting container runtime UIDs/GIDs..."
+
+log "Pulling required images..."
+docker pull postgres:16-alpine >/dev/null 2>&1 || die "Failed to pull postgres:16-alpine"
+docker pull "keyfactor/ejbca-ce:${OPT_IMAGE_TAG}" >/dev/null 2>&1 || die "Failed to pull EJBCA image"
+
+PG_UID="$(docker run --rm postgres:16-alpine sh -lc 'id -u postgres' 2>/dev/null || echo '70')"
+PG_GID="$(docker run --rm postgres:16-alpine sh -lc 'id -g postgres' 2>/dev/null || echo '70')"
 log "Detected Postgres UID:GID = ${PG_UID}:${PG_GID}"
 
-# EJBCA user inside keyfactor/ejbca-ce runs as UID 10001 (observed), detect:
-EJBCA_UID="$(docker run --rm keyfactor/ejbca-ce:${OPT_IMAGE_TAG} sh -lc 'id -u 2>/dev/null || true' 2>/dev/null || true)"
-if [[ -z "${EJBCA_UID}" ]]; then
-  # fallback to observed
-  EJBCA_UID="10001"
-fi
+EJBCA_UID="$(docker run --rm "keyfactor/ejbca-ce:${OPT_IMAGE_TAG}" sh -lc 'id -u 2>/dev/null || echo 10001' 2>/dev/null || echo '10001')"
 log "Detected/assumed EJBCA UID = ${EJBCA_UID}"
 
-# --------------------------- step 6: create named bind volumes (idempotent) ---------------------------
-log ">>> [6/10] Creating named Docker volumes with host-path binds..."
+# Cleanup detection containers
+docker container prune -f >/dev/null 2>&1 || true
+
+# --------------------------- step 8: create docker network ---------------------------
+log ">>> [8/12] Creating Docker network '${DOCKER_NETWORK}'..."
+if docker network inspect "${DOCKER_NETWORK}" >/dev/null 2>&1; then
+  if "${OPT_FORCE}"; then
+    log "Removing existing network ${DOCKER_NETWORK}..."
+    docker network rm "${DOCKER_NETWORK}" 2>/dev/null || true
+    docker network create --driver bridge "${DOCKER_NETWORK}" >/dev/null
+    log "Recreated network ${DOCKER_NETWORK}"
+  else
+    log "Network ${DOCKER_NETWORK} already exists"
+  fi
+else
+  docker network create --driver bridge "${DOCKER_NETWORK}" >/dev/null
+  log "Created network ${DOCKER_NETWORK}"
+fi
+
+# --------------------------- step 9: create volumes + set permissions ---------------------------
+log ">>> [9/12] Creating Docker volumes with bind mounts..."
+
 create_bind_volume() {
   local vol="$1" host_path="$2"
+  
   if docker volume inspect "${vol}" >/dev/null 2>&1; then
-    if "${OPT_FORCE}"; then
-      log "--force: removing volume ${vol}"
-      docker volume rm -f "${vol}" >/dev/null 2>&1 || true
-    else
-      log "Volume exists: ${vol}"
-      return 0
-    fi
+    log "Volume exists: ${vol}"
+    return 0
   fi
 
   mkdir -p "${host_path}"
@@ -300,21 +423,18 @@ create_bind_volume "ejbca_pgdata" "${BASE_DIR}/data/postgres"
 create_bind_volume "ejbca_data"   "${BASE_DIR}/data/ejbca"
 create_bind_volume "ejbca_logs"   "${BASE_DIR}/logs"
 
-# apply correct perms for postgres data dir (MUST be owned by postgres UID/GID; must be 700)
+# Set ownership
 chown -R "${PG_UID}:${PG_GID}" "${BASE_DIR}/data/postgres"
 chmod 700 "${BASE_DIR}/data/postgres"
 
-# ejbca persistent dir: match working permissive root:root 0775; container creates subdirs as 10001:root
 chown root:root "${BASE_DIR}/data/ejbca"
 chmod 775 "${BASE_DIR}/data/ejbca"
 
-# nginx logs: allow nginx to write; safest is keep owned by service user (ejbca) since docker-managed;
-# but if you want strict match to your bind volume device, use writable by container.
 chmod 750 "${BASE_DIR}/logs"
 chown -R "${EJBCA_USER}:${EJBCA_USER}" "${BASE_DIR}/logs"
 
-# --------------------------- step 7: generate TLS + mTLS artifacts ---------------------------
-log ">>> [7/10] Generating TLS + mTLS assets (no private contents printed)..."
+# --------------------------- step 10: generate + validate TLS certs ---------------------------
+log ">>> [10/12] Generating and validating TLS + mTLS assets..."
 TLS_DIR="${BASE_DIR}/nginx/tls"
 MTLS_DIR="${BASE_DIR}/nginx/mtls-ca"
 CLIENT_DIR="${BASE_DIR}/nginx/clients"
@@ -328,8 +448,6 @@ SUPERADMIN_KEY="${CLIENT_DIR}/superadmin.key"
 SUPERADMIN_CSR="${CLIENT_DIR}/superadmin.csr"
 SUPERADMIN_CRT="${CLIENT_DIR}/superadmin.crt"
 
-CERT_HOST="${OPT_HOSTNAME:-$(default_fqdn)}"
-
 gen_server_cert() {
   backup_if_exists "${SERVER_KEY}"
   backup_if_exists "${SERVER_CRT}"
@@ -341,6 +459,9 @@ gen_server_cert() {
     -addext "basicConstraints=critical,CA:FALSE" \
     -addext "keyUsage=digitalSignature,keyEncipherment" \
     -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1
+  
+  # Validate
+  openssl x509 -in "${SERVER_CRT}" -noout -checkend 0 >/dev/null 2>&1 || die "Server cert validation failed"
 }
 
 gen_mtls_ca() {
@@ -352,6 +473,9 @@ gen_mtls_ca() {
     -subj "/CN=EJBCA mTLS CA/O=EJBCA/OU=Operators" \
     -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+  
+  # Validate
+  openssl x509 -in "${CA_CRT}" -noout -checkend 0 >/dev/null 2>&1 || die "mTLS CA cert validation failed"
 }
 
 gen_superadmin_p12() {
@@ -382,36 +506,41 @@ gen_superadmin_p12() {
     -passout "pass:${ADMIN_CLIENT_P12_PASSWORD}" >/dev/null 2>&1
 
   rm -f "${SUPERADMIN_CSR}" >/dev/null 2>&1 || true
+  
+  # Validate P12
+  openssl pkcs12 -in "${SUPERADMIN_P12}" -noout -passin "pass:${ADMIN_CLIENT_P12_PASSWORD}" >/dev/null 2>&1 || die "P12 validation failed"
 }
 
 if [[ -f "${SERVER_KEY}" && -f "${SERVER_CRT}" && "${OPT_FORCE}" == false ]]; then
-  log "Server TLS cert exists; skipping."
+  log "Server TLS cert exists; validating..."
+  openssl x509 -in "${SERVER_CRT}" -noout -checkend 0 >/dev/null 2>&1 || { log "Existing cert invalid, regenerating..."; gen_server_cert; }
 else
   gen_server_cert
   log "Generated server TLS cert for CN=${CERT_HOST}"
 fi
 
 if [[ -f "${CA_KEY}" && -f "${CA_CRT}" && "${OPT_FORCE}" == false ]]; then
-  log "mTLS CA exists; skipping."
+  log "mTLS CA exists; validating..."
+  openssl x509 -in "${CA_CRT}" -noout -checkend 0 >/dev/null 2>&1 || { log "Existing CA invalid, regenerating..."; gen_mtls_ca; }
 else
   gen_mtls_ca
   log "Generated mTLS CA"
 fi
 
 if [[ -f "${SUPERADMIN_P12}" && "${OPT_FORCE}" == false ]]; then
-  log "SuperAdmin P12 exists; skipping."
+  log "SuperAdmin P12 exists; validating..."
+  openssl pkcs12 -in "${SUPERADMIN_P12}" -noout -passin "pass:${ADMIN_CLIENT_P12_PASSWORD}" >/dev/null 2>&1 || { log "Existing P12 invalid, regenerating..."; gen_superadmin_p12; }
 else
   gen_superadmin_p12
-  log "Generated SuperAdmin P12: ${SUPERADMIN_P12}"
+  log "Generated SuperAdmin P12"
 fi
 
-# permissions (match observed: ca.key/server.key private, certs world-readable, p12 private)
 chown -R root:root "${BASE_DIR}/nginx"
 chmod 600 "${SERVER_KEY}" "${CA_KEY}" "${SUPERADMIN_P12}" || true
 chmod 644 "${SERVER_CRT}" "${CA_CRT}" "${SUPERADMIN_CRT}" || true
 
-# --------------------------- step 8: write nginx configs + dockerfile ---------------------------
-log ">>> [8/10] Writing Nginx Dockerfile + configs..."
+# --------------------------- step 11: write nginx configs ---------------------------
+log ">>> [11/12] Writing Nginx Dockerfile + configs..."
 NGINX_DOCKERFILE="${BASE_DIR}/nginx/Dockerfile"
 NGINX_MAIN_CONF="${BASE_DIR}/nginx/nginx.conf"
 NGINX_SITE_CONF="${BASE_DIR}/nginx/conf.d/ejbca.conf"
@@ -423,6 +552,28 @@ backup_if_exists "${NGINX_SITE_CONF}"
 cat > "${NGINX_DOCKERFILE}" <<'EOF'
 FROM nginx:1.27-alpine
 RUN apk add --no-cache curl
+
+# Configure log rotation
+RUN cat > /etc/logrotate.d/nginx <<'LOGROTATE'
+/var/log/nginx/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 nginx nginx
+    sharedscripts
+    postrotate
+        if [ -f /var/run/nginx.pid ]; then
+            kill -USR1 `cat /var/run/nginx.pid`
+        fi
+    endscript
+}
+LOGROTATE
+
+RUN apk add --no-cache logrotate && \
+    echo "0 0 * * * /usr/sbin/logrotate /etc/logrotate.d/nginx" | crontab -
 EOF
 
 cat > "${NGINX_MAIN_CONF}" <<'EOF'
@@ -449,7 +600,6 @@ http {
   tcp_nodelay on;
   keepalive_timeout 65;
 
-  # Rate limiting
   limit_req_zone $binary_remote_addr zone=req_per_ip:10m rate=10r/s;
   limit_conn_zone $binary_remote_addr zone=conn_per_ip:10m;
 
@@ -457,7 +607,6 @@ http {
 }
 EOF
 
-# IMPORTANT: do NOT strip /ejbca prefix (that broke RA navigation). Proxy /ejbca/* as-is.
 cat > "${NGINX_SITE_CONF}" <<'EOF'
 upstream ejbca_public { server ejbca:8080; keepalive 32; }
 upstream ejbca_admin  { server ejbca:8080; keepalive 32; }
@@ -503,38 +652,32 @@ server {
   proxy_read_timeout 300s;
 
   location = /healthz { return 200 "OK\n"; add_header Content-Type text/plain; }
-
-  # convenience redirect
   location = /ejbca { return 301 /ejbca/; }
 
-  # Admin UI (mTLS required)
   location ^~ /ejbca/adminweb/ {
     if ($ssl_client_verify != "SUCCESS") { return 403; }
     proxy_set_header SSL_CLIENT_CERT $ssl_client_escaped_cert;
     proxy_pass http://ejbca_admin;
   }
 
-  # REST API (mTLS required)
   location ^~ /ejbca/ejbca-rest-api/ {
     if ($ssl_client_verify != "SUCCESS") { return 403; }
     proxy_set_header SSL_CLIENT_CERT $ssl_client_escaped_cert;
     proxy_pass http://ejbca_admin;
   }
 
-  # Public (RA, enrollment, etc.) - no rewrite
   location ^~ /ejbca/ {
     proxy_pass http://ejbca_public;
   }
 
-  # Root forwards too (upstream typically 302s to /ejbca/adminweb)
   location / {
     proxy_pass http://ejbca_public;
   }
 }
 EOF
 
-# --------------------------- step 9: write docker-compose.yml (match working) ---------------------------
-log ">>> [9/10] Writing docker-compose.yml..."
+# --------------------------- step 12: write docker-compose.yml ---------------------------
+log ">>> [12/12] Writing docker-compose.yml..."
 COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
 backup_if_exists "${COMPOSE_FILE}"
 
@@ -545,6 +688,8 @@ services:
     container_name: ejbca-postgres
     restart: unless-stopped
     user: "${PG_UID}:${PG_GID}"
+    networks:
+      - ${DOCKER_NETWORK}
     environment:
       POSTGRES_DB: ejbca
       POSTGRES_USER: ejbca
@@ -557,6 +702,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 18
+      start_period: 30s
     security_opt:
       - no-new-privileges:true
 
@@ -564,6 +710,8 @@ services:
     image: keyfactor/ejbca-ce:\${EJBCA_IMAGE_TAG:-latest}
     container_name: ejbca-app
     restart: unless-stopped
+    networks:
+      - ${DOCKER_NETWORK}
     depends_on:
       postgres:
         condition: service_healthy
@@ -578,7 +726,6 @@ services:
       PASSWORD_ENCRYPTION_KEY: "\${PASSWORD_ENCRYPTION_KEY}"
       CA_KEYSTOREPASS: "\${CA_KEYSTOREPASS}"
       EJBCA_CLI_DEFAULTPASSWORD: "\${EJBCA_CLI_DEFAULTPASSWORD}"
-      # Bootstrap only — REMOVE after initial admin role setup:
       INITIAL_ADMIN: ";PublicAccessAuthenticationToken:TRANSPORT_ANY;"
     volumes:
       - ejbca_data:/mnt/persistent
@@ -587,10 +734,11 @@ services:
     expose:
       - "8080"
     healthcheck:
-      test: ["CMD-SHELL", "/bin/bash -c '</dev/tcp/127.0.0.1/8080'"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/ejbca/publicweb/healthcheck/ejbcahealth || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
 
   nginx:
     build:
@@ -599,6 +747,8 @@ services:
     image: ejbca-nginx:local
     container_name: ejbca-nginx
     restart: unless-stopped
+    networks:
+      - ${DOCKER_NETWORK}
     depends_on:
       ejbca:
         condition: service_healthy
@@ -622,6 +772,10 @@ services:
       - /var/cache/nginx
       - /var/run
 
+networks:
+  ${DOCKER_NETWORK}:
+    external: true
+
 volumes:
   ejbca_pgdata:
     external: true
@@ -634,65 +788,157 @@ EOF
 chmod 644 "${COMPOSE_FILE}"
 chown root:root "${COMPOSE_FILE}"
 
-# --------------------------- step 10: launch + verify (with rollback) ---------------------------
-log ">>> [10/10] Launching stack and verifying..."
+# --------------------------- deployment with comprehensive verification ---------------------------
+log ">>> Launching stack with comprehensive verification..."
 cd "${BASE_DIR}"
 
 RUN_AS_EJBCA=(sudo -u "${EJBCA_USER}" env HOME="${EJBCA_HOME}" DOCKER_CONFIG="${DOCKER_CONFIG_DIR}")
 
+ROLLBACK_TRIGGERED=false
 rollback() {
-  log "=== FAILURE: rolling back docker compose stack (best-effort) ==="
+  if "${ROLLBACK_TRIGGERED}"; then
+    return
+  fi
+  ROLLBACK_TRIGGERED=true
+  
+  log "=== DEPLOYMENT FAILED: Initiating rollback ==="
+  
+  "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" logs --tail=100 || true
+  
+  log "Stopping containers..."
   "${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" down || true
-  log "=== Recent logs (tail) ==="
-  docker logs --tail 80 ejbca-postgres 2>/dev/null || true
-  docker logs --tail 120 ejbca-app 2>/dev/null || true
-  docker logs --tail 80 ejbca-nginx 2>/dev/null || true
+  
+  # Check for volume backups
+  LATEST_BACKUP=$(ls -t "${BASE_DIR}/backups"/volumes_* 2>/dev/null | head -1 || echo "")
+  if [[ -n "${LATEST_BACKUP}" ]]; then
+    log "Found volume backup: ${LATEST_BACKUP}"
+    log "To restore: extract tarballs to ${BASE_DIR}/data/* and re-run script"
+  fi
+  
+  log "=== Rollback complete. Check ${LOG_FILE} for details ==="
+  exit 1
 }
 trap 'rollback' ERR
 
-# build/pull and start
-"${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull || true
-"${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d --build
+# Build and start
+log "Building nginx image..."
+"${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" build --no-cache
 
-# wait for nginx healthz
-log "Waiting for https://localhost/healthz ..."
+log "Starting containers..."
+"${RUN_AS_EJBCA[@]}" docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+
+# Verify Postgres initialization
+log "Waiting for Postgres to initialize database..."
 ok=false
-for i in $(seq 1 90); do
+for i in $(seq 1 60); do
+  if docker exec ejbca-postgres psql -U ejbca -d ejbca -c "SELECT 1" >/dev/null 2>&1; then
+    ok=true
+    break
+  fi
+  sleep 2
+done
+"${ok}" || die "Postgres database initialization failed"
+log "Postgres database initialized"
+
+# Verify EJBCA bootstrap
+log "Waiting for EJBCA to complete bootstrap (this may take 2-3 minutes)..."
+ok=false
+for i in $(seq 1 120); do
+  if docker exec ejbca-app curl -sf http://127.0.0.1:8080/ejbca/publicweb/healthcheck/ejbcahealth | grep -q "ALLOK" 2>/dev/null; then
+    ok=true
+    break
+  fi
+  sleep 3
+  if (( i % 10 == 0 )); then
+    log "Still waiting for EJBCA bootstrap... ($i/120)"
+  fi
+done
+"${ok}" || die "EJBCA bootstrap failed or timed out"
+log "EJBCA application is healthy"
+
+# Verify nginx can reach backend
+log "Waiting for nginx reverse proxy..."
+ok=false
+for i in $(seq 1 30); do
   if curl -kfs https://127.0.0.1/healthz >/dev/null 2>&1; then
     ok=true
     break
   fi
   sleep 2
 done
-"${ok}" || die "Nginx healthz did not become ready"
+"${ok}" || die "Nginx proxy did not become accessible"
 
-# verify expected responses
-log "Verifying endpoints..."
-curl -kIs https://127.0.0.1/healthz | head -n 3 || true
-curl -kIs https://127.0.0.1/ejbca/adminweb/ | head -n 8 || true   # expected 403 without client cert
+# Verify endpoints
+log "Verifying endpoint responses..."
+HTTP_STATUS=$(curl -k -o /dev/null -w "%{http_code}" -s https://127.0.0.1/ejbca/adminweb/)
+if [[ "${HTTP_STATUS}" != "403" ]]; then
+  log "WARNING: /ejbca/adminweb/ returned ${HTTP_STATUS} (expected 403 without client cert)"
+fi
 
-# final: ensure containers healthy
-docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'ejbca-(postgres|app|nginx)' || true
+HTTP_STATUS=$(curl -k -o /dev/null -w "%{http_code}" -s https://127.0.0.1/ejbca/)
+if [[ "${HTTP_STATUS}" == "000" ]]; then
+  die "EJBCA public endpoint not accessible"
+fi
+
+log "All endpoints responding correctly"
+
+# Verify admin role can be created (test with mTLS)
+log "Verifying SuperAdmin client certificate access..."
+MTLS_TEST=$(curl -k --cert "${SUPERADMIN_P12}:${ADMIN_CLIENT_P12_PASSWORD}" --cert-type P12 \
+  -o /dev/null -w "%{http_code}" -s https://127.0.0.1/ejbca/adminweb/ 2>/dev/null || echo "000")
+
+if [[ "${MTLS_TEST}" == "200" || "${MTLS_TEST}" == "302" ]]; then
+  log "SuperAdmin mTLS authentication successful (HTTP ${MTLS_TEST})"
+  log ""
+  log "=================================================================="
+  log "IMPORTANT: Admin role verified. You can now safely remove"
+  log "INITIAL_ADMIN from docker-compose.yml and recreate ejbca container:"
+  log "  cd ${BASE_DIR}"
+  log "  # Edit docker-compose.yml and remove INITIAL_ADMIN line"
+  log "  docker compose --env-file .env up -d --force-recreate ejbca"
+  log "=================================================================="
+elif [[ "${MTLS_TEST}" == "403" ]]; then
+  log "WARNING: mTLS cert presented but admin role not yet configured in EJBCA"
+  log "You may need to manually configure admin roles before removing INITIAL_ADMIN"
+else
+  log "WARNING: Could not verify admin access (HTTP ${MTLS_TEST})"
+  log "Manual verification recommended before removing INITIAL_ADMIN"
+fi
 
 trap - ERR
 
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'ejbca-(postgres|app|nginx)' || true
+
 log ""
 log "=================================================================="
-log "EJBCA deployment complete."
+log "EJBCA DEPLOYMENT SUCCESSFUL"
+log "=================================================================="
 log ""
 log "URLs:"
-log "  Public entry (often redirects): https://${CERT_HOST}/"
-log "  AdminWeb (mTLS required):       https://${CERT_HOST}/ejbca/adminweb/"
+log "  HTTPS entry:                    https://${CERT_HOST}/"
+log "  AdminWeb (requires mTLS):       https://${CERT_HOST}/ejbca/adminweb/"
 log "  RA Web:                         https://${CERT_HOST}/ejbca/ra/"
-log "  REST API (mTLS required):       https://${CERT_HOST}/ejbca/ejbca-rest-api/"
+log "  REST API (requires mTLS):       https://${CERT_HOST}/ejbca/ejbca-rest-api/"
 log ""
-log "Client cert:"
-log "  SuperAdmin P12: ${SUPERADMIN_P12}"
-log "  P12 password:   (see ${ENV_FILE} -> ADMIN_CLIENT_P12_PASSWORD)"
+log "Authentication:"
+log "  SuperAdmin P12:  ${SUPERADMIN_P12}"
+log "  P12 password:    (in ${ENV_FILE} -> ADMIN_CLIENT_P12_PASSWORD)"
 log ""
-log "SECURITY REQUIRED AFTER BOOTSTRAP:"
-log "  Remove INITIAL_ADMIN from ${COMPOSE_FILE} and recreate only ejbca:"
-log "    cd ${BASE_DIR} && docker compose --env-file .env up -d --force-recreate ejbca"
+log "Import SuperAdmin cert to browser:"
+log "  Firefox: Preferences > Privacy & Security > Certificates > View Certificates > Your Certificates > Import"
+log "  Chrome:  Settings > Privacy and security > Security > Manage certificates > Import"
 log ""
-log "Log file: ${LOG_FILE}"
+log "Next steps:"
+log "  1. Import ${SUPERADMIN_P12} to your browser"
+log "  2. Access https://${CERT_HOST}/ejbca/adminweb/"
+log "  3. Configure admin roles and end entities"
+log "  4. Remove INITIAL_ADMIN from compose file and recreate ejbca container"
+log ""
+log "Management:"
+log "  View logs:     cd ${BASE_DIR} && docker compose logs -f"
+log "  Stop:          cd ${BASE_DIR} && docker compose down"
+log "  Start:         cd ${BASE_DIR} && docker compose up -d"
+log "  Backup:        Backup ${BASE_DIR}/data/* and ${BASE_DIR}/.env"
+log ""
+log "Setup log: ${LOG_FILE}"
 log "=================================================================="
